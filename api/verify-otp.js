@@ -1,166 +1,287 @@
-import crypto from "crypto";
+import crypto from "node:crypto";
+import { Redis } from "@upstash/redis";
 
-import {
-  Redis
-} from "@upstash/redis";
-
-
-const redis =
-  Redis.fromEnv();
-
+const redis = Redis.fromEnv();
 
 const OTP_SECRET =
   process.env.OTP_HASH_SECRET;
 
+const ALLOWED_ORIGINS = new Set([
+  "http://localhost:5500",
+  "http://127.0.0.1:5500",
 
-const ALLOWED_ORIGIN =
-  process.env.ALLOWED_ORIGIN;
+  ...String(process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+]);
 
 
+/* =========================================================
+   CORS
+========================================================= */
+
+function applyCors(req, res) {
+  const origin =
+    req.headers.origin;
+
+  if (
+    origin &&
+    ALLOWED_ORIGINS.has(origin)
+  ) {
+    res.setHeader(
+      "Access-Control-Allow-Origin",
+      origin
+    );
+  }
+
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "POST, OPTIONS"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type"
+  );
+
+  res.setHeader(
+    "Access-Control-Max-Age",
+    "86400"
+  );
+
+  res.setHeader(
+    "Vary",
+    "Origin"
+  );
+
+  res.setHeader(
+    "Cache-Control",
+    "no-store"
+  );
+}
+
+
+/* =========================================================
+   EMAIL VALIDATION
+========================================================= */
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+
+/* =========================================================
+   REQUEST BODY
+========================================================= */
+
+function getBody(req) {
+  if (!req.body) {
+    return {};
+  }
+
+  if (
+    typeof req.body === "string"
+  ) {
+    try {
+      return JSON.parse(
+        req.body
+      );
+    } catch {
+      return {};
+    }
+  }
+
+  return req.body;
+}
+
+
+/* =========================================================
+   API
+========================================================= */
 
 export default async function handler(
   req,
   res
 ) {
+  /*
+    Must happen before OPTIONS response.
+  */
 
-  setCors(
-    req,
-    res
-  );
+  applyCors(req, res);
 
+
+  /* -----------------------------
+     CORS preflight
+  ----------------------------- */
 
   if (
-    req.method ===
-    "OPTIONS"
+    req.method === "OPTIONS"
   ) {
-
     return res
       .status(204)
       .end();
-
   }
 
 
-  if (
-    req.method !==
-    "POST"
-  ) {
+  /* -----------------------------
+     POST only
+  ----------------------------- */
 
+  if (
+    req.method !== "POST"
+  ) {
     return res
       .status(405)
       .json({
         message:
           "Method not allowed."
       });
-
   }
 
 
   try {
+    if (!OTP_SECRET) {
+      console.error(
+        "OTP_HASH_SECRET is missing."
+      );
 
-    const email =
-      String(
-        req.body?.email ||
+      return res
+        .status(500)
+        .json({
+          message:
+            "Server configuration is incomplete."
+        });
+    }
+
+
+    const body =
+      getBody(req);
+
+
+    const email = String(
+      body.email || ""
+    )
+      .trim()
+      .toLowerCase();
+
+
+    const otp = String(
+      body.otp || ""
+    )
+      .replace(
+        /\D/g,
         ""
-      )
-        .trim()
-        .toLowerCase();
+      );
 
 
-    const otp =
-      String(
-        req.body?.otp ||
-        ""
-      )
-        .replace(
-          /\D/g,
-          ""
-        );
-
+    /* =====================================================
+       VALIDATE REQUEST
+    ===================================================== */
 
     if (
-      !email ||
-      !/^\d{4}$/.test(
-        otp
-      )
+      !isValidEmail(email) ||
+      !/^\d{4}$/.test(otp)
     ) {
-
       return res
         .status(400)
         .json({
           message:
             "Invalid verification request."
         });
-
     }
 
 
+    /* =====================================================
+       GET OTP
+    ===================================================== */
 
     const key =
       `otp:${email}`;
 
 
     const stored =
-      await redis.get(
-        key
-      );
+      await redis.get(key);
 
 
-    if (
-      !stored
-    ) {
+    if (!stored) {
+      return res
+        .status(400)
+        .json({
+          message:
+            "Verification code expired. Please request a new code."
+        });
+    }
+
+
+    /* =====================================================
+       PARSE REDIS RECORD
+    ===================================================== */
+
+    let record;
+
+
+    try {
+      record =
+        typeof stored === "string"
+          ? JSON.parse(stored)
+          : stored;
+    } catch {
+      await redis.del(key);
 
       return res
         .status(400)
         .json({
-
           message:
-            "Verification code expired. Please request a new code."
-
+            "Verification code is no longer valid."
         });
-
     }
 
 
+    if (
+      !record ||
+      !record.hash
+    ) {
+      await redis.del(key);
 
-    const record =
-      typeof stored ===
-      "string"
+      return res
+        .status(400)
+        .json({
+          message:
+            "Verification code is no longer valid."
+        });
+    }
 
-        ? JSON.parse(
-            stored
-          )
 
-        : stored;
+    /* =====================================================
+       MAX ATTEMPTS
+    ===================================================== */
 
+    const attempts =
+      Number(
+        record.attempts || 0
+      );
 
 
     if (
-      Number(
-        record.attempts ||
-        0
-      ) >= 5
+      attempts >= 5
     ) {
-
-      await redis.del(
-        key
-      );
-
+      await redis.del(key);
 
       return res
         .status(429)
         .json({
-
           message:
             "Too many incorrect attempts. Please request a new code."
-
         });
-
     }
 
 
+    /* =====================================================
+       HASH SUBMITTED OTP
+    ===================================================== */
 
-    const submitted =
+    const submittedHash =
       crypto
         .createHmac(
           "sha256",
@@ -172,107 +293,126 @@ export default async function handler(
         .digest();
 
 
-
-    const expected =
-      Buffer.from(
-        record.hash,
-        "hex"
-      );
+    let expectedHash;
 
 
+    try {
+      expectedHash =
+        Buffer.from(
+          record.hash,
+          "hex"
+        );
+    } catch {
+      await redis.del(key);
+
+      return res
+        .status(400)
+        .json({
+          message:
+            "Verification code is no longer valid."
+        });
+    }
+
+
+    /* =====================================================
+       TIMING SAFE COMPARISON
+    ===================================================== */
 
     const valid =
-      expected.length ===
-      submitted.length
+      expectedHash.length ===
+        submittedHash.length &&
 
-      &&
       crypto.timingSafeEqual(
-        expected,
-        submitted
+        expectedHash,
+        submittedHash
       );
 
 
+    /* =====================================================
+       INCORRECT OTP
+    ===================================================== */
 
-    if (
-      !valid
-    ) {
-
+    if (!valid) {
       record.attempts =
-        Number(
-          record.attempts ||
-          0
-        ) + 1;
+        attempts + 1;
 
 
-
-      const ttl =
-        await redis.ttl(
-          key
-        );
+      const remainingTtl =
+        await redis.ttl(key);
 
 
+      /*
+        If OTP has already expired,
+        remove it.
+      */
 
       if (
-        ttl > 0
+        remainingTtl <= 0
       ) {
+        await redis.del(key);
 
-        await redis.set(
-          key,
-          JSON.stringify(
-            record
-          ),
-          {
-            ex: ttl
-          }
-        );
-
+        return res
+          .status(400)
+          .json({
+            message:
+              "Verification code expired. Please request a new code."
+          });
       }
 
+
+      /*
+        Preserve original remaining TTL.
+      */
+
+      await redis.set(
+        key,
+        JSON.stringify(record),
+        {
+          ex: remainingTtl
+        }
+      );
+
+
+      const attemptsLeft =
+        Math.max(
+          0,
+          5 - record.attempts
+        );
 
 
       return res
         .status(400)
         .json({
-
           message:
-            "Incorrect verification code."
-
+            attemptsLeft > 0
+              ? `Incorrect verification code. ${attemptsLeft} attempt${attemptsLeft === 1 ? "" : "s"} remaining.`
+              : "Too many incorrect attempts. Please request a new code."
         });
-
     }
 
 
+    /* =====================================================
+       SUCCESS
 
-    /*
-      OTP becomes unusable
-      immediately after success.
-    */
+       OTP is single-use.
+    ===================================================== */
 
-    await redis.del(
-      key
-    );
-
+    await redis.del(key);
 
 
     return res
       .status(200)
       .json({
-
         ok: true,
 
         verified: true,
 
         email
-
       });
 
-  }
-
-  catch (
-    error
-  ) {
-
+  } catch (error) {
     console.error(
+      "verify-otp error:",
       error
     );
 
@@ -280,49 +420,8 @@ export default async function handler(
     return res
       .status(500)
       .json({
-
         message:
           "Unable to verify code."
-
       });
-
   }
-
-
-
-  function setCors(
-    req,
-    res
-  ) {
-
-    const origin =
-      req.headers.origin;
-
-
-    if (
-      origin ===
-      ALLOWED_ORIGIN
-    ) {
-
-      res.setHeader(
-        "Access-Control-Allow-Origin",
-        origin
-      );
-
-    }
-
-
-    res.setHeader(
-      "Access-Control-Allow-Methods",
-      "POST, OPTIONS"
-    );
-
-
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type"
-    );
-
-  }
-
 }
